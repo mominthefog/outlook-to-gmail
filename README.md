@@ -12,14 +12,29 @@ Messages are added with the Gmail API's `messages.insert`: they land in **All Ma
 
 ## 1. Convert the `.olm` first (Olminator)
 
-Use **Olminator** to convert the Outlook `.olm` to a folder of mail. Pick the export
-option that **preserves the folder structure**. Either of Olminator's outputs works:
+This importer reads standard `.mbox` / `.eml` mail, not Outlook's proprietary `.olm`
+container. Convert the `.olm` first with **Olminator**, a free, native Mac tool that does
+a clean job of it (duplicate handling, date correction, folder structure preserved):
+
+- **Mac App Store:** <https://apps.apple.com/us/app/olminator/id1572678154>
+- **Developer site / docs:** <https://goerke.tech/Mac/Olminator/>
+
+In Olminator's **Converting Emails** settings:
+
+- Leave **"Create individual EML files instead of MBOX container files"** unchecked
+  (MBOX is the recommended input here; it also preserves read/unread).
+- **Uncheck "and create 'auto-merging' .mbox files for Apple Mail."** That produces Apple
+  Mail's `.mbox` *bundle* (a folder), not the plain `.mbox` files this tool reads.
+- Keep **"Keep original folder structure"** checked. This is what the folder-to-label
+  mapping relies on.
+
+Either of Olminator's plain outputs works and the importer auto-detects which:
 
 - a tree of `.mbox` files (one per Outlook folder), or
 - a tree of `.eml` files (each Outlook folder a subfolder, each message a `.eml`).
 
-The importer auto-detects which one you have. Each file/subfolder path becomes the
-label, with sub-folders nested using Gmail's `Parent/Child` convention.
+Each file/subfolder path becomes the label, with sub-folders nested using Gmail's
+`Parent/Child` convention.
 
 ---
 
