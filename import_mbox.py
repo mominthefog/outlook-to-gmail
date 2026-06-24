@@ -274,6 +274,28 @@ def load_done(ledger_file):
 # --------------------------------------------------------------------------- #
 # Insert with backoff
 # --------------------------------------------------------------------------- #
+class DailyLimitReached(Exception):
+    """Gmail signalled the per-user/project daily quota is exhausted for today.
+
+    Unlike per-minute rate limits (which we retry), this won't clear until the
+    quota resets at midnight Pacific, so the caller should stop the whole run
+    and resume on a later day via the checkpoint.
+    """
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(f"Gmail daily limit reached ({reason})")
+
+
+def parse_size(text):
+    """Parse a human size like '450MB' or '2GB' into bytes. Plain int = bytes."""
+    s = text.strip().upper()
+    for suffix, mult in (("GB", 1024**3), ("MB", 1024**2), ("KB", 1024), ("B", 1)):
+        if s.endswith(suffix):
+            return int(float(s[:-len(suffix)]) * mult)
+    return int(s)
+
+
 def insert_message(service, raw_bytes, label_ids, max_retries=6):
     media = MediaIoBaseUpload(
         io.BytesIO(raw_bytes), mimetype="message/rfc822", resumable=False
@@ -295,6 +317,10 @@ def insert_message(service, raw_bytes, label_ids, max_retries=6):
                 reason = json.loads(e.content.decode("utf-8"))["error"]["errors"][0]["reason"]
             except Exception:
                 pass
+            # Daily quota / bandwidth exhaustion won't clear until the Pacific
+            # midnight reset -- stop the run cleanly instead of hammering it.
+            if reason in ("dailyLimitExceeded", "quotaExceeded"):
+                raise DailyLimitReached(reason)
             retryable = status in (429, 500, 502, 503) or reason in (
                 "rateLimitExceeded", "userRateLimitExceeded", "backendError",
             )
@@ -328,7 +354,13 @@ def main():
                     help="Import at most N messages (0 = no limit). For testing.")
     ap.add_argument("--no-resume", action="store_true",
                     help="Ignore the checkpoint ledger and attempt every message.")
+    ap.add_argument("--max-bytes-per-run", default="",
+                    help="Cap total inserted bytes per run, e.g. '450MB' or '2GB'. "
+                         "Stops cleanly when reached; re-run to continue. Useful for "
+                         "staying under Gmail's per-user daily upload limit.")
     args = ap.parse_args()
+
+    max_bytes = parse_size(args.max_bytes_per_run) if args.max_bytes_per_run else 0
 
     if not os.path.exists(args.source):
         sys.exit(f"Source not found: {args.source}")
@@ -361,8 +393,10 @@ def main():
     service = None if args.dry_run else build_gmail_service(args.key, args.user)
     labels = LabelManager(service, args.dry_run)
 
-    stats = {"inserted": 0, "skipped": 0, "failed": 0, "scanned": 0}
+    stats = {"inserted": 0, "skipped": 0, "failed": 0, "scanned": 0, "bytes": 0}
     limit_hit = False
+    stop_run = False
+    stop_reason = ""
 
     for label in sorted(by_label):
         label_id = labels.ensure(label)
@@ -395,6 +429,13 @@ def main():
                                  f"{len(raw)} bytes\n")
                     continue
 
+                # Stop before exceeding the per-run byte cap (stay under the
+                # daily upload ceiling). The checkpoint lets a re-run continue.
+                if max_bytes and stats["bytes"] + len(raw) > max_bytes:
+                    stop_run = True
+                    stop_reason = f"--max-bytes-per-run cap ({args.max_bytes_per_run})"
+                    break
+
                 label_ids = [label_id]
                 if is_unread(hget):
                     label_ids.append("UNREAD")
@@ -402,6 +443,7 @@ def main():
                 try:
                     result = insert_message(service, raw, label_ids)
                     stats["inserted"] += 1
+                    stats["bytes"] += len(raw)
                     per_label += 1
                     done.add(mid)
                     with open(ledger_file, "a", encoding="utf-8") as lf:
@@ -411,17 +453,24 @@ def main():
                             "gmail_id": result.get("id"),
                         }) + "\n")
                     if stats["inserted"] % 100 == 0:
-                        print(f"  ... {stats['inserted']} imported so far")
+                        print(f"  ... {stats['inserted']} imported so far "
+                              f"({stats['bytes'] // (1024 * 1024)} MB this run)")
+                except DailyLimitReached as e:
+                    stop_run = True
+                    stop_reason = f"Gmail daily limit reached ({e.reason})"
+                    break
                 except Exception as e:  # noqa: BLE001
                     stats["failed"] += 1
                     with open(error_file, "a", encoding="utf-8") as ef:
                         ef.write(f"{_now()}\tFAILED\t{label}\t{mid}\t{e}\n")
-            if limit_hit:
+            if limit_hit or stop_run:
                 break
         if args.dry_run:
             print(f"  {label}: {per_label} message(s)")
         if limit_hit:
             print("\nReached --max limit; stopping.")
+            break
+        if stop_run:
             break
 
     print("\n" + "=" * 48)
@@ -429,13 +478,18 @@ def main():
         print(f"DRY RUN: scanned {stats['scanned']} message(s) across "
               f"{len(by_label)} label(s). Nothing written.")
     else:
-        print("Import complete.")
-        print(f"  Inserted: {stats['inserted']}")
+        print("Run stopped early." if stop_run else "Import complete.")
+        print(f"  Inserted: {stats['inserted']} "
+              f"({stats['bytes'] // (1024 * 1024)} MB this run)")
         print(f"  Skipped (already imported): {stats['skipped']}")
         print(f"  Failed:   {stats['failed']}")
         if stats["failed"]:
             print(f"  See errors: {error_file}")
         print(f"  Checkpoint: {ledger_file}")
+        if stop_run:
+            print(f"\n  Stopped: {stop_reason}")
+            print("  This is expected for a large import. Re-run the SAME command to")
+            print("  continue -- already-imported messages are skipped automatically.")
 
 
 def _now():
