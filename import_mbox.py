@@ -32,16 +32,20 @@ import sys
 import time
 from datetime import datetime
 
+# The Google client libraries are only needed for the actual import (building
+# the service and inserting messages). Import them lazily so the module still
+# loads for --dry-run discovery and for tests on a machine without the deps;
+# the friendly "install requirements" error is raised when the service is built.
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaIoBaseUpload
-except ImportError:
-    sys.exit(
-        "Missing dependencies. Activate your venv and run:\n"
-        "    pip install -r requirements.txt"
-    )
+    _GOOGLE_IMPORT_ERROR = None
+except ImportError as _import_err:
+    service_account = build = MediaIoBaseUpload = None
+    HttpError = Exception  # placeholder; real runs exit before this is referenced
+    _GOOGLE_IMPORT_ERROR = _import_err
 
 # Scopes must exactly match what is authorized in the Admin console
 # (Security > API controls > Domain-wide delegation).
@@ -67,6 +71,11 @@ STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
 # --------------------------------------------------------------------------- #
 def build_gmail_service(key_path, user):
     """Build a Gmail API client impersonating `user` via domain-wide delegation."""
+    if _GOOGLE_IMPORT_ERROR is not None:
+        sys.exit(
+            "Missing dependencies. Activate your venv and run:\n"
+            "    pip install -r requirements.txt"
+        )
     creds = service_account.Credentials.from_service_account_file(
         key_path, scopes=SCOPES
     )
@@ -162,13 +171,24 @@ def is_unread(headers_get):
     return False
 
 
-def iter_messages(kind, path):
-    """Yield (raw_bytes, headers_get_callable) for each message in a work unit."""
+def iter_messages(kind, path, on_error=None):
+    """Yield (raw_bytes, headers_get_callable) for each message in a work unit.
+
+    A single message that fails to parse is skipped (reported via on_error)
+    rather than aborting the whole run. In a large archive one corrupt message
+    must not strand the remaining thousands.
+    """
     if kind == "mbox":
         box = mailbox.mbox(path, factory=None, create=False)
         try:
-            for msg in box:
-                raw = msg.as_bytes()
+            for index, key in enumerate(box.keys()):
+                try:
+                    msg = box[key]          # parsing happens on access
+                    raw = msg.as_bytes()
+                except Exception as e:      # noqa: BLE001
+                    if on_error:
+                        on_error(path, index, e)
+                    continue
                 yield raw, msg.get
         finally:
             box.close()
@@ -398,71 +418,79 @@ def main():
     stop_run = False
     stop_reason = ""
 
+    def on_msg_error(path, index, exc):
+        """A message that couldn't be parsed: log it and keep going."""
+        stats["failed"] += 1
+        if args.dry_run:
+            print(f"  ! Skipping unparseable message #{index} in {path}: {exc}")
+        else:
+            with open(error_file, "a", encoding="utf-8") as ef:
+                ef.write(f"{_now()}\tPARSE_ERROR\t{path}\t#{index}\t{exc}\n")
+
     for label in sorted(by_label):
         label_id = labels.ensure(label)
         per_label = 0
         for kind, path in by_label[label]:
             try:
-                msg_iter = iter_messages(kind, path)
+                for raw, hget in iter_messages(kind, path, on_error=on_msg_error):
+                    if args.max and stats["inserted"] >= args.max:
+                        limit_hit = True
+                        break
+                    stats["scanned"] += 1
+                    mid = message_id_for(raw, hget)
+
+                    if mid in done:
+                        stats["skipped"] += 1
+                        continue
+
+                    if args.dry_run:
+                        per_label += 1
+                        continue
+
+                    if len(raw) > MAX_MESSAGE_BYTES:
+                        stats["failed"] += 1
+                        with open(error_file, "a", encoding="utf-8") as ef:
+                            ef.write(f"{_now()}\tTOO_LARGE\t{label}\t{mid}\t"
+                                     f"{len(raw)} bytes\n")
+                        continue
+
+                    # Stop before exceeding the per-run byte cap (stay under the
+                    # daily upload ceiling). The checkpoint lets a re-run continue.
+                    if max_bytes and stats["bytes"] + len(raw) > max_bytes:
+                        stop_run = True
+                        stop_reason = f"--max-bytes-per-run cap ({args.max_bytes_per_run})"
+                        break
+
+                    label_ids = [label_id]
+                    if is_unread(hget):
+                        label_ids.append("UNREAD")
+
+                    try:
+                        result = insert_message(service, raw, label_ids)
+                        stats["inserted"] += 1
+                        stats["bytes"] += len(raw)
+                        per_label += 1
+                        done.add(mid)
+                        with open(ledger_file, "a", encoding="utf-8") as lf:
+                            lf.write(json.dumps({
+                                "message_id": mid,
+                                "label": label,
+                                "gmail_id": result.get("id"),
+                            }) + "\n")
+                        if stats["inserted"] % 100 == 0:
+                            print(f"  ... {stats['inserted']} imported so far "
+                                  f"({stats['bytes'] // (1024 * 1024)} MB this run)")
+                    except DailyLimitReached as e:
+                        stop_run = True
+                        stop_reason = f"Gmail daily limit reached ({e.reason})"
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        stats["failed"] += 1
+                        with open(error_file, "a", encoding="utf-8") as ef:
+                            ef.write(f"{_now()}\tFAILED\t{label}\t{mid}\t{e}\n")
             except Exception as e:  # noqa: BLE001
-                print(f"  ! Could not open {path}: {e}")
+                print(f"  ! Could not read {path}: {e}")
                 continue
-            for raw, hget in msg_iter:
-                if args.max and stats["inserted"] >= args.max:
-                    limit_hit = True
-                    break
-                stats["scanned"] += 1
-                mid = message_id_for(raw, hget)
-
-                if mid in done:
-                    stats["skipped"] += 1
-                    continue
-
-                if args.dry_run:
-                    per_label += 1
-                    continue
-
-                if len(raw) > MAX_MESSAGE_BYTES:
-                    stats["failed"] += 1
-                    with open(error_file, "a", encoding="utf-8") as ef:
-                        ef.write(f"{_now()}\tTOO_LARGE\t{label}\t{mid}\t"
-                                 f"{len(raw)} bytes\n")
-                    continue
-
-                # Stop before exceeding the per-run byte cap (stay under the
-                # daily upload ceiling). The checkpoint lets a re-run continue.
-                if max_bytes and stats["bytes"] + len(raw) > max_bytes:
-                    stop_run = True
-                    stop_reason = f"--max-bytes-per-run cap ({args.max_bytes_per_run})"
-                    break
-
-                label_ids = [label_id]
-                if is_unread(hget):
-                    label_ids.append("UNREAD")
-
-                try:
-                    result = insert_message(service, raw, label_ids)
-                    stats["inserted"] += 1
-                    stats["bytes"] += len(raw)
-                    per_label += 1
-                    done.add(mid)
-                    with open(ledger_file, "a", encoding="utf-8") as lf:
-                        lf.write(json.dumps({
-                            "message_id": mid,
-                            "label": label,
-                            "gmail_id": result.get("id"),
-                        }) + "\n")
-                    if stats["inserted"] % 100 == 0:
-                        print(f"  ... {stats['inserted']} imported so far "
-                              f"({stats['bytes'] // (1024 * 1024)} MB this run)")
-                except DailyLimitReached as e:
-                    stop_run = True
-                    stop_reason = f"Gmail daily limit reached ({e.reason})"
-                    break
-                except Exception as e:  # noqa: BLE001
-                    stats["failed"] += 1
-                    with open(error_file, "a", encoding="utf-8") as ef:
-                        ef.write(f"{_now()}\tFAILED\t{label}\t{mid}\t{e}\n")
             if limit_hit or stop_run:
                 break
         if args.dry_run:
