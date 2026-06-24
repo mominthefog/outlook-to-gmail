@@ -1,0 +1,11 @@
+# Service-account key files (secrets), never commit
+*.json
+
+# Per-run checkpoint ledgers and logs (auto-created at runtime)
+state/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
