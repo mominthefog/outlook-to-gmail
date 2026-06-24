@@ -47,8 +47,8 @@ label, with sub-folders nested using Gmail's `Parent/Child` convention.
 
 ### c. Python environment
 ```bash
-git clone https://github.com/<your-username>/gmail-importer.git
-cd gmail-importer
+git clone https://github.com/mominthefog/outlook-to-gmail.git
+cd outlook-to-gmail
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
