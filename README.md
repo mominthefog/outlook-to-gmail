@@ -1,5 +1,7 @@
 # MBOX → Gmail (Workspace) Importer
 
+[![CI](https://github.com/mominthefog/outlook-to-gmail/actions/workflows/ci.yml/badge.svg)](https://github.com/mominthefog/outlook-to-gmail/actions/workflows/ci.yml)
+
 Import an Outlook for Mac archive into a Google Workspace mailbox, preserving the
 original **folder structure as Gmail labels**, the **original dates**, and
 **read/unread** state. Built for a super admin to run against a user's mailbox using a
@@ -98,7 +100,26 @@ python import_mbox.py --source ./client-archive/ \
 | `--label-prefix` | Optional top-level label to nest everything under (e.g. `Outlook`). |
 | `--dry-run` | Preview only; no writes. |
 | `--max N` | Import at most N messages (for testing). |
+| `--max-bytes-per-run` | Cap total inserted bytes per run, e.g. `450MB` or `2GB`. Stops cleanly when reached; re-run to continue. Useful for staying under Gmail's per-user daily upload limit. |
 | `--no-resume` | Ignore the checkpoint and attempt every message again. |
+
+### Large archives and Gmail's daily limit
+
+Gmail enforces a per-user daily upload ceiling (roughly 500 MB/user/day via the
+API). A multi-gigabyte archive therefore can't import in a single run. Two things
+make this painless:
+
+- **Automatic stop.** When Gmail signals the daily quota is exhausted
+  (`dailyLimitExceeded` / `quotaExceeded`), the importer stops the run cleanly
+  instead of hammering the API, and prints how far it got. This is expected, not
+  an error.
+- **Just re-run.** Re-run the **same command** after the quota resets (midnight
+  Pacific). The checkpoint skips everything already imported, so each day picks up
+  where the last left off. A large mailbox typically takes several days.
+
+Optionally pass `--max-bytes-per-run 450MB` to stop proactively under the ceiling
+rather than waiting for Gmail to reject the request. Either way, re-running the
+same command continues safely.
 
 ---
 
@@ -122,8 +143,10 @@ python import_mbox.py --source ./client-archive/ \
 - `state/<user>.jsonl`: one line per imported message (its `Message-ID`, label, and the
   new Gmail id). This is what makes re-runs safe and resumable. Delete it only if you
   want to allow re-importing the same archive.
-- `state/<user>-errors.log`: messages that failed after retries, or were skipped for
-  being over Gmail's 50 MB limit.
+- `state/<user>-errors.log`: messages that failed after retries (`FAILED`), were
+  skipped for being over Gmail's 50 MB limit (`TOO_LARGE`), or couldn't be parsed
+  from the source archive (`PARSE_ERROR`). A single unparseable message is logged
+  and skipped; it never aborts the run.
 
 ---
 
@@ -132,6 +155,21 @@ python import_mbox.py --source ./client-archive/ \
 1. Admin console → Domain-wide delegation → remove the importer's entry.
 2. Google Cloud → the service account → **Keys** → delete the JSON key (and delete the
    service account if it won't be reused).
+
+---
+
+## Development
+
+The pure helpers and the mbox reader have offline unit tests (no credentials or
+network needed):
+
+```bash
+python -m unittest -v      # run the tests
+ruff check import_mbox.py test_import_mbox.py   # lint
+```
+
+CI (GitHub Actions) runs the linter, a byte-compile, and the tests on Python
+3.9–3.12 for every push and pull request.
 
 ---
 
