@@ -53,10 +53,14 @@ SCOPES = [
 # Gmail rejects raw messages larger than ~50 MB.
 MAX_MESSAGE_BYTES = 50 * 1024 * 1024
 
-# Reserved Gmail system label names that cannot be created as user labels.
+# Reserved Gmail label names that cannot be created as user labels. Beyond the
+# obvious system labels, Gmail also reserves a few concept names like "Archive"
+# (it returns 400 "Invalid label name"). The set below is a best-effort list;
+# LabelManager._create also has a runtime fallback for any we miss.
 RESERVED_LABELS = {
     "INBOX", "SENT", "DRAFT", "DRAFTS", "SPAM", "TRASH", "CHAT",
-    "STARRED", "IMPORTANT", "UNREAD",
+    "STARRED", "IMPORTANT", "UNREAD", "ARCHIVE", "ALL MAIL", "SNOOZED",
+    "SCHEDULED", "OUTBOX", "BIN",
 }
 
 STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
@@ -220,11 +224,32 @@ class LabelManager:
 
     def _create(self, name):
         create_name = name
-        # A leaf segment matching a reserved system name can't be created.
+        # A leaf segment matching a known reserved name can't be created.
         if name.split("/")[-1].upper() in RESERVED_LABELS:
             create_name = name + " (Imported)"
             if create_name in self.cache:
                 return self.cache[create_name]
+        try:
+            return self._do_create(create_name)
+        except HttpError as e:
+            reason = ""
+            try:
+                reason = json.loads(
+                    e.content.decode("utf-8"))["error"]["errors"][0]["reason"]
+            except Exception:
+                pass
+            # Gmail reserves some names beyond the obvious system labels and
+            # rejects them with 400 invalidArgument. Fall back to a suffixed
+            # name so an unattended run self-heals instead of crashing.
+            if (e.resp.status == 400 and reason in ("invalidArgument", "")
+                    and not create_name.endswith(" (Imported)")):
+                create_name = create_name + " (Imported)"
+                if create_name in self.cache:
+                    return self.cache[create_name]
+                return self._do_create(create_name)
+            raise
+
+    def _do_create(self, create_name):
         body = {
             "name": create_name,
             "labelListVisibility": "labelShow",
@@ -234,6 +259,7 @@ class LabelManager:
             lbl = self.service.users().labels().create(
                 userId="me", body=body
             ).execute()
+            self.cache[create_name] = lbl["id"]
             return lbl["id"]
         except HttpError as e:
             # 409: already exists (race or case difference) -> reload and reuse.
